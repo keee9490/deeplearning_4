@@ -1,45 +1,89 @@
 import torch
 import torch.nn as nn
+import math
 
-class MultiHeadSelfAttention(nn.Module):
-    def __init__(self, d_model, n_heads):
+
+class MultiHeadAttention(nn.Module):
+    """
+    多头自注意力层
+    """
+
+    def __init__(self, d_model, n_heads, dropout=0.1):
         super().__init__()
+        assert d_model % n_heads == 0, "d_model 必须能被 n_heads 整除"
+
+        self.d_model = d_model
         self.n_heads = n_heads
-        self.head_dim = d_model // n_heads
-        self.qkv = nn.Linear(d_model, d_model*3)
-        self.fc_out = nn.Linear(d_model, d_model)
-        self.softmax = nn.Softmax(dim=-1)
+        self.d_k = d_model // n_heads
 
-    def forward(self, x, mask=None):
-        B, T, d_model = x.shape
-        qkv = self.qkv(x).reshape(B, T, 3, self.n_heads, self.head_dim).permute(2,0,3,1,4)
-        q, k, v = qkv[0], qkv[1], qkv[2]  # B, nH, T, d
-        att = (q @ k.transpose(-2,-1)) / (self.head_dim ** 0.5)
+        self.w_q = nn.Linear(d_model, d_model)
+        self.w_k = nn.Linear(d_model, d_model)
+        self.w_v = nn.Linear(d_model, d_model)
+        self.fc = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(p=dropout)
+
+        # 新增: 用于存储注意力权重
+        self.attention_weights = None
+
+    def forward(self, query, key, value, mask=None):
+        batch_size = query.size(0)
+
+        Q = self.w_q(query).view(batch_size, -1, self.n_heads, self.d_k).transpose(1, 2)
+        K = self.w_k(key).view(batch_size, -1, self.n_heads, self.d_k).transpose(1, 2)
+        V = self.w_v(value).view(batch_size, -1, self.n_heads, self.d_k).transpose(1, 2)
+
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
+
         if mask is not None:
-            # mask为(B, T)，转(B,1,T)，再广播到(B,nH,T,T)
-            mask = mask.unsqueeze(1).unsqueeze(2)
-            att = att.masked_fill(mask==0, -1e9)
-        att = self.softmax(att)
-        out = att @ v
-        out = out.transpose(1,2).contiguous().reshape(B,T,d_model)
-        return self.fc_out(out)
+            scores = scores.masked_fill(mask == 0, -1e9)
 
-class AddNorm(nn.Module):
-    def __init__(self, d_model):
+        # 保存softmax之前的权重
+        self.attention_weights = torch.softmax(scores, dim=-1)
+
+        attention_weights_with_dropout = self.dropout(self.attention_weights)
+
+        context = torch.matmul(attention_weights_with_dropout, V)
+
+        context = context.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
+        output = self.fc(context)
+
+        return output
+
+
+class PositionWiseFeedForward(nn.Module):
+    """位置前馈网络"""
+
+    def __init__(self, d_model, d_ff, dropout=0.1):
         super().__init__()
-        self.norm = nn.LayerNorm(d_model)
+        self.fc1 = nn.Linear(d_model, d_ff)
+        self.fc2 = nn.Linear(d_ff, d_model)
+        self.dropout = nn.Dropout(p=dropout)
+        self.relu = nn.ReLU()
 
-    def forward(self, x, sublayer_out):
-        return self.norm(x + sublayer_out)
+    def forward(self, x):
+        return self.fc2(self.dropout(self.relu(self.fc1(x))))
 
-# Test
-if __name__ == "__main__":
-    x = torch.randn(2, 8, 32)
-    mask = torch.ones(2,8)
-    attn = MultiHeadSelfAttention(32, 4)
-    out = attn(x, mask)
-    print("多头注意力输出shape", out.shape)
-    # Add&Norm
-    addnorm = AddNorm(32)
-    result = addnorm(x, out)
-    print("Add&Norm输出shape", result.shape)
+
+class EncoderLayer(nn.Module):
+    """
+    Transformer编码器层
+    """
+
+    def __init__(self, d_model, n_heads, d_ff, dropout=0.1):
+        super().__init__()
+        self.self_attn = MultiHeadAttention(d_model, n_heads, dropout)
+        self.feed_forward = PositionWiseFeedForward(d_model, d_ff, dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(p=dropout)
+
+    def forward(self, x, mask):
+        _x = x
+        attn_output = self.self_attn(x, x, x, mask)
+        x = self.norm1(_x + self.dropout(attn_output))
+
+        _x = x
+        ff_output = self.feed_forward(x)
+        x = self.norm2(_x + self.dropout(ff_output))
+
+        return x
